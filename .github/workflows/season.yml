@@ -1,0 +1,38 @@
+name: Change season
+
+on:
+  # 00:30 UTC on the 1st of every month (06:00 in Mumbai).
+  schedule:
+    - cron: '30 0 1 * *'
+  # Run it by hand from the Actions tab to pick any season.
+  workflow_dispatch:
+    inputs:
+      season:
+        description: 'Season to show (auto = by month)'
+        type: choice
+        default: auto
+        options: [auto, night, fall, winter, spring]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node scripts/build-readme.mjs "${{ inputs.season || 'auto' }}"
+      - name: Commit if the README changed
+        run: |
+          if git diff --quiet README.md; then
+            echo "Already in this season."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Change README season"
+          git push
