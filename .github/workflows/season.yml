@@ -25,7 +25,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install fonttools brotli pillow
+      - run: pip install fonttools brotli
       # A manual run saves its choice to season.txt; scheduled runs keep it.
       - run: python scripts/build.py ${{ inputs.season }}
       - name: Commit if anything changed

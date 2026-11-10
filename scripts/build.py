@@ -1,24 +1,28 @@
-"""Builds the GitHub profile: seasonal SVG cards, a terminal GIF and README.md.
+"""Builds the GitHub profile as one seasonal page (a single SVG) and README.md.
 
 The look comes from the portfolio (github.com/Taz3rr/Portfolio): the same
 fonts (Anybody, Instrument Serif, JetBrains Mono), the same four seasons
 (Night, Fall, Winter, Spring) and the same procedural trees and weather.
 
-    python scripts/build.py           # the season in season.txt ("auto" = by month)
-    python scripts/build.py winter    # switch to a season (saved to season.txt)
-    python scripts/build.py auto      # back to following the calendar
-    python scripts/build.py --no-gif  # skip the terminal GIF
+The page, top to bottom: hero, loadout, journey, contributions, terminal.
 
-Needs: pip install fonttools brotli pillow
+    python scripts/build.py             # the season in season.txt ("auto" = by month)
+    python scripts/build.py winter      # switch to a season (saved to season.txt)
+    python scripts/build.py auto        # back to following the calendar
+    python scripts/build.py --offline   # use the saved contributions instead of fetching
+
+Needs: pip install fonttools brotli
 """
 
 import base64
 import datetime as dt
 import html
 import io
+import json
 import math
 import re
 import sys
+import urllib.request
 from pathlib import Path
 
 from fontTools import subset
@@ -29,8 +33,8 @@ ROOT = Path(__file__).resolve().parent.parent
 ART = ROOT / 'art'
 FONTS = ROOT / 'fonts'
 ICONS = ROOT / 'icons'
-CACHE = ROOT / '.cache'
 SEASON_FILE = ROOT / 'season.txt'
+CONTRIB_FILE = ART / 'contributions.json'
 
 USER = 'Taz3rr'
 PORTFOLIO = 'https://portfolio-mu-one-3aqkxqrvc0.vercel.app'
@@ -68,24 +72,29 @@ LANES = [
 
 # ---------------------------------------------------------------- seasons
 # Colours are the portfolio's tokens (src/styles/base.css, World.css, scenery.js).
+# `ramp` colours the contribution graph, from a quiet day to a busy one.
 
 SEASONS = {
-    'night': dict(label='Night', hint='navy, black and white', dark=True,
+    'night': dict(label='Night', dark=True,
                   bg='#04060d', bg2='#0a1330', bg3='#101d45', fg='#e9ecf4', mute='#8a95b3', dim='#4a5576',
                   line='rgba(233,236,244,0.12)', rule='#1a2444', accent='#ffffff', hi='#5b7bd9',
-                  fill='#ffffff', on_fill='#0a1330', card='rgba(10,19,48,0.62)', branch='#0d1a3e'),
-    'fall': dict(label='Fall', hint='autumn', dark=False,
+                  fill='#ffffff', on_fill='#0a1330', card='rgba(10,19,48,0.62)', branch='#0d1a3e',
+                  cell='rgba(233,236,244,0.07)', ramp=['#1b3270', '#2f4ea8', '#5b7bd9', '#a9bcf2']),
+    'fall': dict(label='Fall', dark=False,
                  bg='#f6e7ce', bg2='#f1dcb9', bg3='#fbf1df', fg='#3f2a1d', mute='#6b4423', dim='#a8835f',
                  line='rgba(63,42,29,0.18)', rule='#e3cdaa', accent='#c65d32', hi='#c65d32',
-                 fill='#9e3f2d', on_fill='#f6e7ce', card='rgba(251,241,223,0.74)', branch='#3f2a1d'),
-    'winter': dict(label='Winter', hint='snow', dark=False,
+                 fill='#9e3f2d', on_fill='#f6e7ce', card='rgba(251,241,223,0.74)', branch='#3f2a1d',
+                 cell='rgba(63,42,29,0.08)', ramp=['#ecc98f', '#e0b05a', '#d99a4e', '#c65d32']),
+    'winter': dict(label='Winter', dark=False,
                    bg='#f7fbff', bg2='#e8f3fa', bg3='#ffffff', fg='#2b404c', mute='#4f6a7a', dim='#94adbc',
                    line='rgba(67,93,107,0.18)', rule='#d3e2ec', accent='#4d7590', hi='#4d7590',
-                   fill='#435d6b', on_fill='#f7fbff', card='rgba(255,255,255,0.74)', branch='#708fa3'),
-    'spring': dict(label='Spring', hint='bloom', dark=False,
+                   fill='#435d6b', on_fill='#f7fbff', card='rgba(255,255,255,0.74)', branch='#708fa3',
+                   cell='rgba(67,93,107,0.08)', ramp=['#c9dfec', '#a9c7d8', '#708fa3', '#4d7590']),
+    'spring': dict(label='Spring', dark=False,
                    bg='#fff9ee', bg2='#f3f8ec', bg3='#ffffff', fg='#2e3b2b', mute='#56664f', dim='#a1b199',
                    line='rgba(46,59,43,0.15)', rule='#e1e8d8', accent='#c4547f', hi='#c4547f',
-                   fill='#e89ab8', on_fill='#2e3b2b', card='rgba(255,255,255,0.72)', branch='#5f7d4f'),
+                   fill='#e89ab8', on_fill='#2e3b2b', card='rgba(255,255,255,0.72)', branch='#5f7d4f',
+                   cell='rgba(46,59,43,0.07)', ramp=['#fbd9e6', '#f5c2d7', '#e89ab8', '#c4547f']),
 }
 LEAF_COLORS = ['#D99A4E', '#C65D32', '#9E3F2D', '#6B4423', '#E0B05A']
 # Dec-Feb winter, Mar-May spring, Jun-Aug night, Sep-Nov fall.
@@ -141,20 +150,6 @@ def woff2_base64(face, chars):
     f.save(buf)
     return base64.b64encode(buf.getvalue()).decode()
 
-
-_mono_path = []
-
-
-def mono_ttf_path():
-    """The mono instance as a file, for Pillow. Written once per run."""
-    if not _mono_path:
-        font('fm')
-        CACHE.mkdir(exist_ok=True)
-        p = CACHE / 'mono.ttf'
-        p.write_bytes(_font_bytes['fm'])
-        _mono_path.append(p)
-    return _mono_path[0]
-
 # ---------------------------------------------------------------- helpers
 
 
@@ -183,12 +178,13 @@ def f1(n):
 
 
 class Doc:
-    """One SVG card. Collects the characters each font draws so it can embed
-    just those glyphs."""
+    """The page. Collects the characters each font draws so it can embed just
+    those glyphs, plus shared defs and CSS."""
 
-    def __init__(self, w, h, s):
-        self.w, self.h, self.s = w, h, s
-        self.defs, self.body, self.css = [], [], []
+    def __init__(self, s):
+        self.s = s
+        self.w, self.h = W, 0
+        self.defs, self.css = [], []
         self.used = {}
 
     def text(self, x, y, txt, face, size, fill, ls=0.0, anchor='start', extra=''):
@@ -200,23 +196,28 @@ class Doc:
             a += f' text-anchor="{anchor}"'
         return f'<text {a}{extra}>{esc(txt)}</text>'
 
-    def render(self, title):
+    def spans(self, x, y, segs, face, size):
+        """One line of differently coloured runs: [(text, colour), ...]."""
+        for t, _ in segs:
+            self.used.setdefault(face, set()).update(t)
+        runs = ''.join(f'<tspan fill="{c}">{esc(t)}</tspan>' for t, c in segs)
+        return f'<text x="{f1(x)}" y="{f1(y)}" class="{face}" font-size="{f1(size)}" xml:space="preserve">{runs}</text>'
+
+    def render(self, title, body):
         faces = ''.join(
             f"@font-face{{font-family:'{k}';src:url(data:font/woff2;base64,{woff2_base64(k, v)}) format('woff2')}}"
             f".{k}{{font-family:'{k}'}}"
             for k, v in sorted(self.used.items()))
-        css = faces + ''.join(self.css) + (
-            '@media (prefers-reduced-motion:reduce){*{animation:none!important}}')
+        css = faces + ''.join(self.css)
         return (f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
                 f'viewBox="0 0 {self.w} {self.h}" width="{self.w}" height="{self.h}" role="img" aria-label="{esc(title)}">'
-                f'<title>{esc(title)}</title><style>{css}</style><defs>{"".join(self.defs)}</defs>'
-                f'{"".join(self.body)}</svg>')
+                f'<title>{esc(title)}</title><style>{css}</style><defs>{"".join(self.defs)}</defs>{body}</svg>')
 
 
 BASE_CSS = (
     '.sw{transform-box:fill-box;transform-origin:center}'
     '@keyframes fall{from{transform:translateY(-40px)}to{transform:translateY(var(--h))}}'
-    '@keyframes drift{from{transform:translate(0,-40px)}to{transform:translate(-180px,var(--h))}}'
+    '@keyframes drift{from{transform:translate(0,-40px)}to{transform:translate(-260px,var(--h))}}'
     '@keyframes sway{0%,100%{transform:translateX(-12px) rotate(-28deg)}50%{transform:translateX(12px) rotate(28deg)}}'
     '@keyframes twinkle{0%,100%{opacity:.12}50%{opacity:1}}'
     '@keyframes spin{to{transform:rotate(360deg)}}'
@@ -224,22 +225,10 @@ BASE_CSS = (
     '@keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}'
     '@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}'
     '@keyframes treesway{from{transform:rotate(-.7deg)}to{transform:rotate(.7deg)}}'
+    '@keyframes blink{50%{opacity:0}}'
+    # Without motion everything shows at rest, and the typing covers step aside.
+    '@media (prefers-reduced-motion:reduce){*{animation:none!important}.cover{display:none}}'
 )
-
-
-def card_frame(d, rx=22):
-    """Sky, grain and border for a card; returns (open, close) wrapping the content."""
-    s, w, h = d.s, d.w, d.h
-    d.defs.append(f'<clipPath id="card"><rect width="{w}" height="{h}" rx="{rx}"/></clipPath>')
-    d.defs.append(
-        '<filter id="grain" x="0" y="0" width="100%" height="100%">'
-        '<feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" stitchTiles="stitch"/>'
-        '<feColorMatrix values="0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 .55 0"/></filter>')
-    d.css.append(BASE_CSS + f'svg{{--h:{h + 40}px}}')
-    sky = sky_layers(d)
-    grain = f'<rect width="{w}" height="{h}" filter="url(#grain)" opacity="{0.07 if s["dark"] else 0.05}"/>'
-    border = f'<rect x=".5" y=".5" width="{w - 1}" height="{h - 1}" rx="{rx}" fill="none" stroke="{s["line"]}"/>'
-    return f'<g clip-path="url(#card)">{sky}{grain}', f'</g>{border}'
 
 
 def sky_layers(d):
@@ -247,8 +236,8 @@ def sky_layers(d):
     rect = f'<rect width="{w}" height="{h}" fill="url(#%s)"/>'
     if key == 'night':
         d.defs.append(
-            '<radialGradient id="sk1" cx=".5" cy="-.12" r=".75"><stop offset="0" stop-color="#0f2056"/>'
-            '<stop offset=".62" stop-color="#0f2056" stop-opacity="0"/></radialGradient>'
+            '<radialGradient id="sk1" cx=".5" cy="-.04" r=".7" gradientTransform="translate(.5 0) scale(1 .35) translate(-.5 0)">'
+            '<stop offset="0" stop-color="#0f2056"/><stop offset="1" stop-color="#0f2056" stop-opacity="0"/></radialGradient>'
             '<radialGradient id="sk2" cx="1" cy="1" r=".6"><stop offset="0" stop-color="#0d1c4a" stop-opacity=".8"/>'
             '<stop offset="1" stop-color="#0d1c4a" stop-opacity="0"/></radialGradient>')
         return f'<rect width="{w}" height="{h}" fill="#04060d"/>' + rect % 'sk1' + rect % 'sk2'
@@ -257,22 +246,22 @@ def sky_layers(d):
             '<radialGradient id="sk1" cx=".5" cy=".45" r=".78"><stop offset="0" stop-color="#f6e7ce"/>'
             '<stop offset=".48" stop-color="#f6e7ce"/><stop offset=".68" stop-color="#efd2a4"/>'
             '<stop offset=".86" stop-color="#e2ad6b"/><stop offset="1" stop-color="#d99a4e"/></radialGradient>'
-            '<radialGradient id="sk2" cx="0" cy="1" r=".5"><stop offset="0" stop-color="#3f2a1d" stop-opacity=".35"/>'
+            '<radialGradient id="sk2" cx="0" cy="1" r=".5"><stop offset="0" stop-color="#3f2a1d" stop-opacity=".3"/>'
             '<stop offset="1" stop-color="#3f2a1d" stop-opacity="0"/></radialGradient>')
         return rect % 'sk1' + rect % 'sk2'
     if key == 'winter':
         d.defs.append(
             '<linearGradient id="sk1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a9c7d8"/>'
-            '<stop offset=".16" stop-color="#c9dfec"/><stop offset=".38" stop-color="#e8f3fa"/>'
-            '<stop offset=".6" stop-color="#f7fbff"/><stop offset=".82" stop-color="#f7fbff"/>'
+            '<stop offset=".05" stop-color="#c9dfec"/><stop offset=".14" stop-color="#e8f3fa"/>'
+            '<stop offset=".25" stop-color="#f7fbff"/><stop offset=".88" stop-color="#f7fbff"/>'
             '<stop offset="1" stop-color="#e8f3fa"/></linearGradient>')
         return rect % 'sk1'
     d.defs.append(
         '<linearGradient id="sk1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#d7eaf4"/>'
-        '<stop offset=".36" stop-color="#fff9ee"/><stop offset=".74" stop-color="#fff9ee"/>'
+        '<stop offset=".12" stop-color="#fff9ee"/><stop offset=".85" stop-color="#fff9ee"/>'
         '<stop offset="1" stop-color="#ddefd5"/></linearGradient>'
-        '<radialGradient id="sk2" cx=".88" cy="0" r=".5"><stop offset="0" stop-color="#fff1a8" stop-opacity=".6"/>'
-        '<stop offset="1" stop-color="#fff1a8" stop-opacity="0"/></radialGradient>')
+        '<radialGradient id="sk2" cx=".88" cy="0" r=".5" gradientTransform="translate(.88 0) scale(1 .2) translate(-.88 0)">'
+        '<stop offset="0" stop-color="#fff1a8" stop-opacity=".6"/><stop offset="1" stop-color="#fff1a8" stop-opacity="0"/></radialGradient>')
     return rect % 'sk1' + rect % 'sk2'
 
 # ---------------------------------------------------------------- season marks and weather
@@ -293,7 +282,7 @@ def mark(key, s):
     if key == 'winter':
         arms = ''.join(f'<path transform="rotate({a})" d="M0 0V-10.5M-3.4 -8.8 0 -5.6 3.4 -8.8"/>'
                        for a in range(0, 360, 60))
-        return (f'<g fill="none" stroke="{s["accent"]}" stroke-width="1.7" stroke-linecap="round">{arms}</g>')
+        return f'<g fill="none" stroke="{s["accent"]}" stroke-width="1.7" stroke-linecap="round">{arms}</g>'
     petals = ''.join(f'<ellipse cx="0" cy="-5.4" rx="4" ry="5.6" transform="rotate({a})"/>' for a in range(0, 360, 72))
     return f'<g fill="#e89ab8">{petals}</g><circle r="2.6" fill="#fff1a8" stroke="#c4547f" stroke-width=".6"/>'
 
@@ -305,23 +294,30 @@ def live_mark(d, x, y, scale=0.62, pulse=True):
             f'{mark(d.s["key"], d.s)}</g></g>')
 
 
-def weather(d, n, seed, top=0):
-    """Falling leaves, snow, drifting petals or twinkling stars over the whole card."""
+def weather(d, seed):
+    """Falling leaves, snow, drifting petals or twinkling stars down the whole page."""
     key, w, h = d.s['key'], d.w, d.h
     r = rng(seed)
+    per_1000 = {'night': 46, 'fall': 18, 'winter': 40, 'spring': 20}[key]
+    n = int(per_1000 * h / 1000)
     out = []
     if key == 'night':
+        still = []
         for i in range(n):
-            x, y = r() * w, top + r() * (h - top)
+            x, y = r() * w, r() * h
             sc = 0.15 + r() * 0.3
             dur, delay = 2.5 + r() * 4, r() * 6
+            if i % 3:
+                still.append(xform(STAR, x, y, 0, sc))
+                continue
             out.append(f'<g transform="translate({f1(x)} {f1(y)}) scale({sc:.2f})"><path class="sw" d="{STAR}" fill="#fff" '
                        f'style="animation:twinkle {dur:.1f}s ease-in-out -{delay:.1f}s infinite"/></g>')
-        return '<g>' + ''.join(out) + '</g>'
+        return f'<g><path d="{"".join(still)}" fill="#fff" opacity=".55"/>' + ''.join(out) + '</g>'
     d.defs.append(f'<path id="leaf" d="{LEAF}"/>')
+    lo, hi_ = {'fall': (34, 60), 'winter': (22, 40), 'spring': (30, 48)}[key]   # px per second
     for i in range(n):
-        x = r() * (w + (180 if key == 'spring' else 0))
-        dur = (9 if key == 'fall' else 13 if key == 'winter' else 11) + r() * 8
+        x = r() * (w + (260 if key == 'spring' else 0))
+        dur = (h + 40) / (lo + r() * (hi_ - lo))
         delay = r() * dur
         sdur, sdelay = 2.6 + r() * 2.4, r() * 4
         if key == 'fall':
@@ -329,8 +325,7 @@ def weather(d, n, seed, top=0):
             shape = f'<use href="#leaf" fill="{LEAF_COLORS[int(r() * 5)]}" transform="scale({sc:.2f})" opacity=".9"/>'
         elif key == 'winter':
             if r() < 0.7:
-                rad = 1.4 + r() * 2.2
-                shape = f'<circle r="{rad:.1f}" fill="#fff" stroke="#a9c7d8" stroke-width=".7"/>'
+                shape = f'<circle r="{1.4 + r() * 2.2:.1f}" fill="#fff" stroke="#a9c7d8" stroke-width=".7"/>'
             else:
                 arms = ''.join(f'<path transform="rotate({a})" d="M0 0V-6M-2 -5 0 -3.2 2 -5"/>' for a in range(0, 360, 60))
                 shape = f'<g fill="none" stroke="#a9c7d8" stroke-width="1.1" stroke-linecap="round">{arms}</g>'
@@ -372,47 +367,93 @@ def make_tree(seed, depth=7, length=230, width=26, lean=0.12):
     return branches, tips, joints
 
 
+def xform(d, tx, ty, rot=0.0, sc=1.0):
+    """Bakes translate(tx ty) rotate(rot) scale(sc) into an absolute M/L/C/Z path,
+    so many shapes can share one <path> (far cheaper to redraw every frame)."""
+    c, s_ = math.cos(math.radians(rot)) * sc, math.sin(math.radians(rot)) * sc
+    out, nums = [], []
+    for tk in re.findall(r'[A-Za-z]|-?\d*\.?\d+', d):
+        if tk.isalpha():
+            out.append(tk)
+            continue
+        nums.append(float(tk))
+        if len(nums) == 2:
+            x, y = nums
+            nums = []
+            out.append(f'{tx + x * c - y * s_:.1f} {ty + x * s_ + y * c:.1f}')
+    return ' '.join(out)
+
+
+def circle_d(cx, cy, r):
+    return f'M{cx - r:.1f} {cy:.1f}a{r:.1f} {r:.1f} 0 1 0 {2 * r:.1f} 0a{r:.1f} {r:.1f} 0 1 0 {-2 * r:.1f} 0z'
+
+
+def bloom_d(x, y, k):
+    """Five petals (ellipses 3.4 x 5 around the centre) as one path."""
+    out = []
+    for a in range(0, 360, 72):
+        ra = math.radians(a)
+        ex, ey = x + 10 * k * math.sin(ra), y - 10 * k * math.cos(ra)
+        rx, ry = 3.4 * k, 5 * k
+        out.append(f'M{x:.1f} {y:.1f}A{rx:.1f} {ry:.1f} {a} 1 0 {ex:.1f} {ey:.1f}'
+                   f'A{rx:.1f} {ry:.1f} {a} 1 0 {x:.1f} {y:.1f}z')
+    return ''.join(out)
+
+
 def tree_svg(d, seed, transform, origin):
+    """The portfolio's tree for the season. Branches are merged by width and
+    leaves by colour, so the whole tree is a handful of paths."""
     s, key = d.s, d.s['key']
     branches, tips, joints = make_tree(seed)
     r = rng(seed + 101)
-    parts = []
+    by_w = {}
     for path, wd, dpt in branches:
-        parts.append(f'<path d="{path}" stroke="{s["branch"]}" stroke-width="{wd:.1f}"/>')
-    wood = f'<g fill="none" stroke-linecap="round">{"".join(parts)}</g>'
+        by_w.setdefault(round(wd, 1), []).append(path)
+    wood = ''.join(f'<path d="{"".join(ps)}" stroke-width="{w}"/>' for w, ps in sorted(by_w.items(), reverse=True))
+    wood = f'<g fill="none" stroke="{s["branch"]}" stroke-linecap="round">{wood}</g>'
     extra = []
     if key == 'winter':
-        caps = [f'<path d="{p}" stroke-width="{wd * 0.5:.1f}" transform="translate(0 {-wd * 0.32:.1f})"/>'
-                for p, wd, dpt in branches if dpt >= 1]
-        extra.append(f'<g fill="none" stroke="#fff" stroke-linecap="round" opacity=".95">{"".join(caps)}</g>')
-        extra += [f'<circle cx="{x:.0f}" cy="{y - 2:.0f}" r="{4 + r() * 4:.1f}" fill="#fff"/>' for x, y in tips if r() < 0.5]
+        caps = {}
+        for p, wd, dpt in branches:
+            if dpt >= 1:
+                caps.setdefault(round(wd, 1), []).append(p)
+        extra.append('<g fill="none" stroke="#fff" stroke-linecap="round" opacity=".95">' + ''.join(
+            f'<path d="{"".join(ps)}" stroke-width="{w * 0.5:.1f}" transform="translate(0 {-w * 0.32:.1f})"/>'
+            for w, ps in caps.items()) + '</g>')
+        snow = ''.join(circle_d(x, y - 2, 4 + r() * 4) for x, y in tips if r() < 0.5)
+        extra.append(f'<path d="{snow}" fill="#fff"/>')
     elif key == 'fall':
-        d.defs.append(f'<path id="tleaf" d="{LEAF}"/>')
+        by_c = {}
         for x, y in tips:
             for _ in range(3):
-                extra.append(f'<use href="#tleaf" fill="{LEAF_COLORS[int(r() * 5)]}" transform="translate({x + (r() - .5) * 34:.0f} '
-                             f'{y + (r() - .5) * 30:.0f}) rotate({r() * 360:.0f}) scale({1.2 + r() * 0.9:.2f})"/>')
+                c = LEAF_COLORS[int(r() * 5)]
+                by_c.setdefault(c, []).append(
+                    xform(LEAF, x + (r() - .5) * 34, y + (r() - .5) * 30, r() * 360, 1.2 + r() * 0.9))
+        extra += [f'<path d="{"".join(ps)}" fill="{c}"/>' for c, ps in by_c.items()]
     elif key == 'spring':
-        d.defs.append('<path id="sleaf" d="M0 0C6 -6 16 -5 20 0 16 5 6 6 0 0z"/>')
+        by_c = {}
         for x, y in tips:
             for _ in range(2):
                 c = '#7fb878' if r() < 0.35 else '#a8d5a2'
-                extra.append(f'<use href="#sleaf" fill="{c}" transform="translate({x + (r() - .5) * 24:.0f} '
-                             f'{y + (r() - .5) * 22:.0f}) rotate({r() * 360:.0f}) scale({1.1 + r() * 0.6:.2f})"/>')
-        petals = ''.join(f'<ellipse cx="0" cy="-5" rx="3.4" ry="5" transform="rotate({a})"/>' for a in range(0, 360, 72))
-        d.defs.append(f'<g id="bloom">{petals}</g>')
+                by_c.setdefault(c, []).append(xform('M0 0C6 -6 16 -5 20 0 16 5 6 6 0 0z', x + (r() - .5) * 24,
+                                                    y + (r() - .5) * 22, r() * 360, 1.1 + r() * 0.6))
+        extra += [f'<path d="{"".join(ps)}" fill="{c}"/>' for c, ps in by_c.items()]
+        blooms, eyes = {}, []
         for x, y in joints:
             if r() < 0.4:
                 c = '#f5c2d7' if r() < 0.6 else '#fff6fa'
-                extra.append(f'<g transform="translate({x:.0f} {y:.0f}) scale({1.3 + r() * 0.8:.2f})">'
-                             f'<use href="#bloom" fill="{c}"/><circle r="1.9" fill="#fff1a8"/></g>')
+                k = 1.3 + r() * 0.8
+                blooms.setdefault(c, []).append(bloom_d(x, y, k))
+                eyes.append(circle_d(x, y, 1.9 * k))
+        extra += [f'<path d="{"".join(ps)}" fill="{c}"/>' for c, ps in blooms.items()]
+        extra.append(f'<path d="{"".join(eyes)}" fill="#fff1a8"/>')
     ox, oy = origin
     return (f'<g transform="{transform}"><g style="transform-origin:{ox}px {oy}px;'
             f'animation:treesway 6s ease-in-out infinite alternate">{wood}{"".join(extra)}</g></g>')
 
 
-def winter_ground(d):
-    """Distant mountains and a snowbank, as on the portfolio's winter page."""
+def winter_ground(d, height=260):
+    """Distant mountains and a snowbank along the bottom of the page."""
     w, h = d.w, d.h
     r = rng(5)
 
@@ -425,8 +466,8 @@ def winter_ground(d):
         pts.append((w, h))
         return 'M' + ' '.join(f'{px:.0f} {py:.0f}' for px, py in pts) + 'Z'
     sx = w / 1440
-    return (f'<path d="{ridge(h - 70, 90, 120)}" fill="#c9dfec" opacity=".7"/>'
-            f'<path d="{ridge(h - 40, 60, 90)}" fill="#a9c7d8" opacity=".45"/>'
+    return (f'<path d="{ridge(h - height + 90, 90, 120)}" fill="#c9dfec" opacity=".7"/>'
+            f'<path d="{ridge(h - height + 150, 60, 90)}" fill="#a9c7d8" opacity=".45"/>'
             f'<g transform="translate(0 {h - 56}) scale({sx:.4f} .62)">'
             '<path d="M0 90V46c120-26 220-8 340-18s210-30 330-12 240 30 380 10 260-22 390-6v70z" fill="#e8f3fa"/>'
             '<path d="M0 90V58c140-22 240-4 360-14s200-26 320-10 250 26 370 8 250-18 390-4v52z" fill="#fff"/></g>')
@@ -442,42 +483,35 @@ def icon(name, label, x, y, size, color, d):
              '<path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></g>')
     elif name:
         svg = (ICONS / f'{name}.svg').read_text(encoding='utf8')
-        g = f'<path d="{re.search(r" d=\"([^\"]+)\"", svg).group(1)}" fill="{color}"/>'
+        path = re.search(r' d="([^"]+)"', svg).group(1)
+        g = f'<path d="{path}" fill="{color}"/>'
     else:
         d.used.setdefault('fm', set()).add(label[0].upper())
         g = (f'<rect x="1.5" y="1.5" width="21" height="21" rx="5" fill="none" stroke="{color}" stroke-width="2"/>'
              f'<text x="12" y="17" class="fm" font-size="13" fill="{color}" text-anchor="middle">{esc(label[0].upper())}</text>')
     return f'<g transform="translate({f1(x)} {f1(y)}) scale({sc:.4f})">{g}</g>'
 
-# ---------------------------------------------------------------- cards
+# ---------------------------------------------------------------- sections
+# Each section draws in its own coordinates (0,0 at its top-left) and returns
+# (svg, height). The page stacks them with no gaps.
 
 
-def header(d, y, title, sub, meta=None, chip=None):
-    """Card heading: big display title, a serif aside, and a mono note on the right."""
+def header(d, y, title, sub, meta=None):
+    """Section heading: big display title, a serif aside, and a mono note on the right."""
     s = d.s
     out = [d.text(48, y, title.upper(), 'fd', 46, s['fg'], ls=0.01)]
     tw = measure('fd', title.upper(), 46, 0.01)
     out.append(d.text(48 + tw + 16, y - 2, sub, 'fs', 21, s['mute']))
-    x = d.w - 48
-    if chip:
-        cw = measure('fm', chip, 11, 0.16) + 22
-        out.append(f'<rect x="{f1(x - cw)}" y="{y - 27}" width="{f1(cw)}" height="26" rx="13" fill="{s["fill"]}"/>')
-        out.append(d.text(x - cw / 2 + 0.9, y - 10, chip, 'fm', 11, s['on_fill'], ls=0.16, anchor='middle'))
-        x -= cw + 12
     if meta:
-        out.append(d.text(x, y - 10, meta.upper(), 'fm', 11, s['mute'], ls=0.16, anchor='end'))
+        out.append(d.text(d.w - 48, y - 10, meta.upper(), 'fm', 11, s['mute'], ls=0.16, anchor='end'))
     out.append(f'<path d="M48 {y + 22}H{d.w - 48}" stroke="{s["line"]}"/>')
     return ''.join(out)
 
 
-def hero_svg(s, today):
+def sec_hero(d, ctx):
     H = 430
-    d = Doc(W, H, s)
-    key = s['key']
-    open_, close = card_frame(d)
-    b = [open_]
-    if key == 'winter':
-        b.append(winter_ground(d))
+    s, key = d.s, d.s['key']
+    b = []
     if key == 'night':
         d.defs.append('<radialGradient id="glow" cx=".86" cy=".32" r=".42"><stop offset="0" stop-color="#5b7bd9" stop-opacity=".34"/>'
                       '<stop offset="1" stop-color="#5b7bd9" stop-opacity="0"/></radialGradient>')
@@ -485,77 +519,64 @@ def hero_svg(s, today):
     # The tree is ~840 units tall: at this scale the crown just fits, trunk set in from the edge.
     k = 0.52
     b.append(tree_svg(d, 7, f'translate({W - 70} {H - 1010 * k + 8:.0f}) scale(-{k} {k})', (0, 1010)))
-    b.append(weather(d, {'night': 80, 'fall': 26, 'winter': 70, 'spring': 30}[key], 11))
 
-    t = []
-    # Top line, as on the portfolio hero.
-    t.append(d.text(56, 64, 'MUMBAI, INDIA', 'fm', 11, s['fg'], ls=0.16))
-    t.append(d.text(56 + measure('fm', 'MUMBAI, INDIA', 11, 0.16) + 14, 64, '19.07° N, 72.87° E', 'fm', 11, s['mute'], ls=0.16))
+    b.append(d.text(56, 64, 'MUMBAI, INDIA', 'fm', 11, s['fg'], ls=0.16))
+    b.append(d.text(56 + measure('fm', 'MUMBAI, INDIA', 11, 0.16) + 14, 64, '19.07° N, 72.87° E', 'fm', 11, s['mute'], ls=0.16))
 
     # TAZ3R: display capitals with the 3 set in the serif italic, like the portfolio.
     size, x, base = 176, 50, 236
-    glyphs = []
-    for ch in 'TAZ3R':
+    for i, ch in enumerate('TAZ3R'):
         if ch.isdigit():
             ss = size * 1.12
-            glyphs.append(d.text(x + 4, base, ch, 'fs', ss, s['hi'] if s['dark'] else s['accent']))
+            g = d.text(x + 4, base, ch, 'fs', ss, s['hi'] if s['dark'] else s['accent'])
             x += measure('fs', ch, ss) + 8
         else:
-            glyphs.append(d.text(x, base, ch, 'fd', size, s['fg']))
+            g = d.text(x, base, ch, 'fd', size, s['fg'])
             x += measure('fd', ch, size)
-    name_end = x
-    for i, g in enumerate(glyphs):
-        t.append(f'<g style="animation:rise .9s cubic-bezier(.16,1,.3,1) {i * 0.07:.2f}s both">{g}</g>')
+        b.append(f'<g style="animation:rise .9s cubic-bezier(.16,1,.3,1) {i * 0.07:.2f}s both">{g}</g>')
     aka = 'ABDUR RAHMAAN'
     aw = measure('fm', aka, 12, 0.18)
-    t.append(d.text(name_end - aw, base + 30, aka, 'fm', 12, s['fg'], ls=0.18))
-    t.append(d.text(name_end - aw - 8, base + 31, 'aka', 'fs', 19, s['mute'], anchor='end'))
+    b.append(d.text(x - aw, base + 30, aka, 'fm', 12, s['fg'], ls=0.18))
+    b.append(d.text(x - aw - 8, base + 31, 'aka', 'fs', 19, s['mute'], anchor='end'))
 
-    t.append(d.text(56, 318, 'I build Discord bots, and turn data into dashboards.', 'fs', 30, s['fg']))
-    t.append(d.text(56, 348, 'DATA SCIENCE & BUSINESS ANALYTICS  ·  PYTHON  ·  SQL  ·  BI', 'fm', 11, s['mute'], ls=0.16))
+    b.append(d.text(56, 318, 'I build Discord bots, and turn data into dashboards.', 'fs', 30, s['fg']))
+    b.append(d.text(56, 348, 'DATA SCIENCE & BUSINESS ANALYTICS  ·  PYTHON  ·  SQL  ·  BI', 'fm', 11, s['mute'], ls=0.16))
 
-    # Status chip with the season's live mark.
     status = 'OPEN TO A FULL-TIME INTERNSHIP  ·  AVAILABLE NOW'
     cw = measure('fm', status, 11, 0.14) + 52
-    t.append(f'<rect x="56" y="368" width="{f1(cw)}" height="32" rx="16" fill="{s["card"]}" stroke="{s["line"]}"/>')
-    t.append(live_mark(d, 76, 384, 0.55))
-    t.append(d.text(94, 388, status, 'fm', 11, s['fg'], ls=0.14))
+    b.append(f'<rect x="56" y="368" width="{f1(cw)}" height="32" rx="16" fill="{s["card"]}" stroke="{s["line"]}"/>')
+    b.append(live_mark(d, 76, 384, 0.55))
+    b.append(d.text(94, 388, status, 'fm', 11, s['fg'], ls=0.14))
 
     # The rotating badge from the portfolio hero.
     cx, cy, rr = 628, 128, 50
     d.defs.append(f'<path id="ring" d="M{cx} {cy}m-{rr} 0a{rr} {rr} 0 1 1 {2 * rr} 0a{rr} {rr} 0 1 1 -{2 * rr} 0"/>')
     ring_txt = 'SCROLL TO GAIN XP · SCROLL TO GAIN XP · '
     d.used.setdefault('fm', set()).update(ring_txt)
-    t.append(f'<circle cx="{cx}" cy="{cy}" r="{rr + 16}" fill="{s["card"]}" stroke="{s["line"]}"/>')
-    t.append(f'<g style="transform-origin:{cx}px {cy}px;animation:spin 22s linear infinite">'
+    b.append(f'<circle cx="{cx}" cy="{cy}" r="{rr + 16}" fill="{s["card"]}" stroke="{s["line"]}"/>')
+    b.append(f'<g style="transform-origin:{cx}px {cy}px;animation:spin 22s linear infinite">'
              f'<text class="fm" font-size="10.4" letter-spacing="2.6" fill="{s["fg"]}">'
              f'<textPath href="#ring" xlink:href="#ring">{esc(ring_txt)}</textPath></text></g>')
-    t.append(f'<path d="M{cx} {cy - 14}v28M{cx - 9} {cy + 5}l9 9 9-9" fill="none" stroke="{s["fg"]}" '
+    b.append(f'<path d="M{cx} {cy - 14}v28M{cx - 9} {cy + 5}l9 9 9-9" fill="none" stroke="{s["fg"]}" '
              f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>')
 
-    # Season tag, top right.
     tag = f'SEASON · {s["label"].upper()}'
     tw = measure('fm', tag, 11, 0.16) + 46
-    t.append(f'<rect x="{f1(W - 40 - tw)}" y="44" width="{f1(tw)}" height="30" rx="15" fill="{s["bg2"] if s["dark"] else s["bg3"]}" stroke="{s["line"]}"/>')
-    t.append(live_mark(d, W - 40 - tw + 19, 59, 0.5))
-    t.append(d.text(W - 40 - tw + 34, 63, tag, 'fm', 11, s['fg'], ls=0.16))
-
-    b += t
-    b.append(close)
-    d.body = b
-    return d.render('Taz3r, aka Abdur Rahmaan. I build Discord bots, and turn data into dashboards.')
+    b.append(f'<rect x="{f1(W - 40 - tw)}" y="44" width="{f1(tw)}" height="30" rx="15" '
+             f'fill="{s["bg2"] if s["dark"] else s["bg3"]}" stroke="{s["line"]}"/>')
+    b.append(live_mark(d, W - 40 - tw + 19, 59, 0.5))
+    b.append(d.text(W - 40 - tw + 34, 63, tag, 'fm', 11, s['fg'], ls=0.16))
+    return ''.join(b), H
 
 
-def loadout_svg(s):
+def sec_loadout(d, ctx):
+    s = d.s
     gap, pw = 16, (W - 96 - 32) / 3
     ph, top = 214, 128
     strip_y = top + 2 * ph + gap + 26
-    H = strip_y + 46 + 40
-    d = Doc(W, H, s)
-    open_, close = card_frame(d)
-    b = [open_, weather(d, {'night': 60, 'fall': 18, 'winter': 46, 'spring': 22}[s['key']], 23)]
+    H = strip_y + 46 + 44
     total = sum(len(g[2]) for g in TOOLKIT) + len(SOFT)
-    b.append(header(d, 84, 'Loadout', f'{total} tools equipped', meta='grouped by where each fits', chip='LVL MAX'))
+    b = [header(d, 84, 'Loadout', f'{total} tools equipped', meta='grouped by where each fits')]
 
     for i, (name, blurb, items) in enumerate(TOOLKIT):
         col, row = i % 3, i // 3
@@ -590,28 +611,21 @@ def loadout_svg(s):
     b.append(d.text(54 + lw / 2 + 0.9, strip_y + 27, label, 'fm', 11, s['on_fill'], ls=0.16, anchor='middle'))
     run = d.text(sx, strip_y + 27, seq * 3, 'fm', 11, s['mute'], ls=0.2)
     b.append(f'<g clip-path="url(#strip)"><g style="animation:marquee 26s linear infinite">{run}</g></g>')
-    b.append(d.text(W - 48, H - 18, 'SOFT SKILLS, FROM MANAGING TWO ESPORTS TEAMS', 'fm', 9.5, s['dim'], ls=0.18, anchor='end'))
-    b.append(close)
-    d.body = b
-    names = ', '.join(it[0] for g in TOOLKIT for it in g[2])
-    return d.render(f'Loadout: {names}. Soft skills: {", ".join(SOFT)}.')
+    b.append(d.text(W - 48, H - 20, 'SOFT SKILLS, FROM MANAGING TWO ESPORTS TEAMS', 'fm', 9.5, s['dim'], ls=0.18, anchor='end'))
+    return ''.join(b), H
 
 
-def journey_svg(s, today):
+def sec_journey(d, ctx):
+    s, today = d.s, ctx['month']
     top, lane_h = 150, 70
     H = top + len(LANES) * lane_h + 84
-    d = Doc(W, H, s)
     X0, X1 = 48, W - 48
     span = (JOURNEY_END - JOURNEY_START).days
 
     def xd(day):
         return X0 + (min(max(day, JOURNEY_START), JOURNEY_END) - JOURNEY_START).days / span * (X1 - X0)
 
-    open_, close = card_frame(d)
-    b = [open_, weather(d, {'night': 50, 'fall': 14, 'winter': 36, 'spring': 16}[s['key']], 37)]
-    b.append(header(d, 84, 'Journey', 'one degree, and everything alongside it', meta=f'Jun 2024 — {today:%b %Y}'))
-
-    # Year rules.
+    b = [header(d, 84, 'Journey', 'one degree, and everything alongside it', meta=f'Jun 2024 — {today:%b %Y}')]
     for yr in (2025, 2026, 2027):
         x = xd(dt.date(yr, 1, 1))
         b.append(f'<path d="M{f1(x)} {top + 6}V{H - 58}" stroke="{s["line"]}" stroke-dasharray="2 5"/>')
@@ -648,34 +662,125 @@ def journey_svg(s, today):
             g.append(d.text(mx + 10, by + 30, label.upper(), 'fm', 9, s['fg'], ls=0.16, anchor='end'))
         b.append(''.join(g))
 
-    # Now marker.
-    b.append(f'<path d="M{f1(nx)} {top + 6}V{H - 58}" stroke="{s["accent"] if not s["dark"] else s["fg"]}" stroke-width="1.5" stroke-dasharray="4 4"/>')
+    b.append(f'<path d="M{f1(nx)} {top + 6}V{H - 58}" stroke="{s["fg"] if s["dark"] else s["accent"]}" stroke-width="1.5" stroke-dasharray="4 4"/>')
     nl = f'NOW · {today:%b %Y}'.upper()
     nw = measure('fm', nl, 10, 0.16) + 40
     b.append(f'<rect x="{f1(nx - nw / 2)}" y="{top - 22}" width="{f1(nw)}" height="26" rx="13" fill="{s["fill"]}"/>')
     b.append(d.text(nx - nw / 2 + 30, top - 5, nl, 'fm', 10, s['on_fill'], ls=0.16))
     on = dict(s, accent=s['on_fill'])
-    b.append(f'<g transform="translate({f1(nx - nw / 2 + 16)} {top - 9}) scale(.46)">{mark(s["key"], on) if s["key"] in ("night", "winter") else mark(s["key"], s)}</g>')
-
+    b.append(f'<g transform="translate({f1(nx - nw / 2 + 16)} {top - 9}) scale(.46)">'
+             f'{mark(s["key"], on if s["key"] in ("night", "winter") else s)}</g>')
     b.append(d.text(X0, H - 18, "MLMS SEASON 1 CHAMPIONS, MAY 2026  ·  INDIA'S FIRST TEAM AT MLBB'S MID SEASON CUP",
                     'fm', 9.5, s['mute'], ls=0.16))
-    b.append(close)
-    d.body = b
-    return d.render('Journey: BASc at HSNC University (2024–2027); Tartarus esports team manager (2025); '
-                    'bot developer and moderator for the Moba Legends: 5v5 Discord (2025–present); '
-                    'True Rippers esports manager (2026), MLMS Season 1 champions.')
-
-# ---------------------------------------------------------------- terminal GIF
+    return ''.join(b), H
 
 
-def terminal_gif(s, out):
-    from PIL import Image, ImageDraw, ImageFont
+def sec_contributions(d, ctx):
+    """The last year of GitHub contributions, painted in the season: the busiest
+    days become the season's mark (a star, a leaf, a snowflake, a blossom)."""
+    s, data = d.s, ctx['contrib']
+    if not data:
+        H = 200
+        return header(d, 84, 'Contributions', 'the graph is on its way') + d.text(
+            48, 150, 'COULD NOT READ THE CONTRIBUTION GRAPH ON THIS BUILD.', 'fm', 11, s['mute'], ls=0.16), H
 
-    mono = ImageFont.truetype(str(mono_ttf_path()), 17)
-    small = ImageFont.truetype(str(mono_ttf_path()), 12)
-    fg, mute, hi = s['fg'], s['mute'], s['hi'] if s['dark'] else s['accent']
+    days = data['days']
+    dates = [dt.date.fromisoformat(x['date']) for x in days]
+    start = dates[0] - dt.timedelta(days=(dates[0].weekday() + 1) % 7)   # the Sunday the graph starts on
+    cols = (dates[-1] - start).days // 7 + 1
+    gx, gy = 48 + 36, 158
+    pitch = min(16.4, (W - 48 - gx) / cols)
+    cell = pitch * 0.8
+
+    total = data['total']
+    first, last = dates[0], dates[-1]
+    b = [header(d, 84, 'Contributions', f'{total:,} in the last year',
+                meta=f'{first:%b %Y} — {last:%b %Y}')]
+
+    for row, name in ((1, 'MON'), (3, 'WED'), (5, 'FRI')):
+        b.append(d.text(48, gy + row * pitch + cell - 2, name, 'fm', 9, s['mute'], ls=0.12))
+
+    last_label = -9
+    for c in range(cols):
+        sat = start + dt.timedelta(days=c * 7 + 6)
+        prev = start + dt.timedelta(days=(c - 1) * 7 + 6)
+        if (c == 0 or sat.month != prev.month) and c - last_label >= 3 and c < cols - 1:
+            b.append(d.text(gx + c * pitch, gy - 12, f'{sat:%b}'.upper(), 'fm', 9.5, s['mute'], ls=0.12))
+            last_label = c
+
+    def rrect(x, y, sz, rad=3):
+        e = sz - 2 * rad
+        return (f'M{x + rad:.1f} {y:.1f}h{e:.1f}a{rad} {rad} 0 0 1 {rad} {rad}v{e:.1f}a{rad} {rad} 0 0 1 {-rad} {rad}'
+                f'h{-e:.1f}a{rad} {rad} 0 0 1 {-rad} {-rad}v{-e:.1f}a{rad} {rad} 0 0 1 {rad} {-rad}z')
+
+    by_fill, peaks = {}, []
+    for x, day in zip(days, dates):
+        c, r = (day - start).days // 7, (day.weekday() + 1) % 7
+        cx, cy = gx + c * pitch, gy + r * pitch
+        lvl = x['level']
+        if lvl >= 4:
+            peaks.append(f'<g transform="translate({f1(cx + cell / 2)} {f1(cy + cell / 2)}) scale({cell / 20:.3f})">'
+                         f'{mark(s["key"], dict(s, accent=s["ramp"][3] if s["key"] != "night" else "#ffffff"))}</g>')
+        else:
+            by_fill.setdefault(s['cell'] if lvl == 0 else s['ramp'][lvl - 1], []).append(rrect(cx, cy, cell))
+    cells = ''.join(f'<path d="{"".join(ps)}" fill="{c}"/>' for c, ps in by_fill.items()) + ''.join(peaks)
+    b.append(f'<g style="animation:rise .9s cubic-bezier(.16,1,.3,1) .2s both">{cells}</g>')
+
+    # Streaks and the busiest day.
+    longest = run = 0
+    for x in days:
+        run = run + 1 if x['count'] > 0 else 0
+        longest = max(longest, run)
+    tail = days[::-1]
+    if tail and tail[0]['count'] == 0:
+        tail = tail[1:]   # today may not have one yet
+    current = 0
+    for x in tail:
+        if x['count'] == 0:
+            break
+        current += 1
+    best = max(days, key=lambda x: x['count'])
+    bd = dt.date.fromisoformat(best['date'])
+
+    sy = gy + 7 * pitch + 46
+    stats = [('TOTAL', f'{total:,}', 'IN A YEAR'),
+             ('BEST DAY', str(best['count']), f'{bd:%b} {bd.day}'.upper() if best['count'] else '—'),
+             ('LONGEST STREAK', str(longest), 'DAYS' if longest != 1 else 'DAY'),
+             ('CURRENT STREAK', str(current), 'DAYS' if current != 1 else 'DAY')]
+    for i, (k, v, unit) in enumerate(stats):
+        x = 48 + i * 168
+        b.append(d.text(x, sy, k, 'fm', 9.5, s['mute'], ls=0.16))
+        b.append(d.text(x, sy + 38, v, 'fd', 36, s['fg']))
+        b.append(d.text(x + measure('fd', v, 36) + 8, sy + 38, unit, 'fm', 9.5, s['mute'], ls=0.14))
+
+    # Legend: less ... more, ending on the season mark.
+    lx = W - 48
+    sw = 13
+    items = [s['cell']] + s['ramp'][:3]
+    b.append(d.text(lx, sy + 34, 'MORE', 'fm', 9, s['mute'], ls=0.14, anchor='end'))
+    mx = lx - measure('fm', 'MORE', 9, 0.14) - 16
+    b.append(f'<g transform="translate({f1(mx)} {sy + 30}) scale({sw / 20:.3f})">'
+             f'{mark(s["key"], dict(s, accent=s["ramp"][3] if s["key"] != "night" else "#ffffff"))}</g>')
+    x = mx - 12
+    for c in reversed(items):
+        x -= sw + 4
+        b.append(f'<rect x="{f1(x)}" y="{sy + 24}" width="{sw}" height="{sw}" rx="3" fill="{c}"/>')
+    b.append(d.text(x - 8, sy + 34, 'LESS', 'fm', 9, s['mute'], ls=0.14, anchor='end'))
+    H = sy + 76
+    return ''.join(b), H
+
+
+def sec_terminal(d, ctx):
+    """A terminal that types out who I am, now and what I use. Pure SVG, so it
+    takes the season like the rest of the page."""
+    s = d.s
+    fg, mute = s['fg'], s['mute']
+    hi = s['hi'] if s['dark'] else s['accent']
     win = s['bg2'] if s['dark'] else s['bg3']
+    size, lh = 16.5, 28
+    adv = measure('fm', 'm', size)
     prompt = [('taz3r@mumbai', hi), (':~$ ', mute)]
+    pw = adv * len('taz3r@mumbai:~$ ')
     script = [
         ('whoami', [[('Abdur Rahmaan Reshamwala', fg), ('  ·  aka Taz3r  ·  Mumbai, India', mute)]]),
         ('cat now.txt', [
@@ -684,63 +789,135 @@ def terminal_gif(s, out):
             [('● ', hi), ('open to a full-time internship, available immediately', fg)]]),
         ('python -m loadout --top 8', [[('python  sql  discord.py  asyncio  sqlite  power-bi  tableau  linux', fg)]]),
     ]
+    rows = sum(1 + len(o) for _, o in script) + 1
+    wx, wy, ww = 48, 36, W - 96
+    wh = 40 + 22 + rows * lh + 14
+    H = wy + wh + 44
 
-    lh, padx, top = 28, 30, 66
-    rows = sum(1 + len(o) for _, o in script)
-    GW, GH = W, top + rows * lh + 26
+    # Timeline (seconds) for one loop.
+    t, events = 0.5, []
+    for cmd, outs in script:
+        p_t = t
+        t0 = t + 0.45
+        t1 = t0 + len(cmd) * 0.06
+        o_t = t1 + 0.35
+        events.append((cmd, outs, p_t, t0, t1, o_t))
+        t = o_t + len(outs) * 0.14 + 0.8
+    final_t = t
+    T = final_t + 5.0
 
-    def frame(done, partial=None, cursor=True):
-        im = Image.new('RGB', (GW, GH), win)
-        dr = ImageDraw.Draw(im)
-        dr.rectangle([0, 0, GW - 1, 40], fill=s['bg'] if s['dark'] else s['bg2'])
-        dr.line([0, 40, GW, 40], fill=s['rule'])
-        dr.rectangle([0, 0, GW - 1, GH - 1], outline=s['rule'])
-        for k, c in enumerate([hi, s['dim'], s['rule'] if s['dark'] else s['dim']]):
-            dr.ellipse([22 + k * 20, 15, 34 + k * 20, 27], fill=c)
-        title = 'taz3r@mumbai: ~'
-        dr.text(((GW - small.getlength(title)) / 2, 13), title, font=small, fill=mute)
-        tag = f'SEASON · {s["label"].upper()}'
-        dr.text((GW - 24 - small.getlength(tag), 13), tag, font=small, fill=mute)
-        y = top - 8
-        lines = list(done) + ([partial] if partial is not None else [])
-        cx = None
-        for segs in lines:
-            x = padx
-            for txt, col in segs:
-                dr.text((x, y), txt, font=mono, fill=col)
-                x += mono.getlength(txt)
-            cx, cy = x, y
+    def pc(x):
+        return f'{x / T * 100:.2f}'
+
+    def appear(name, at):
+        d.css.append(f'@keyframes {name}{{0%,{pc(at)}%{{opacity:0}}{pc(at + 0.02)}%,98%{{opacity:1}}100%{{opacity:0}}}}')
+        return f'style="animation:{name} {T:.2f}s linear infinite both"'
+
+    b = [f'<rect x="{wx}" y="{wy}" width="{ww}" height="{wh}" rx="14" fill="{win}" stroke="{s["rule"]}"/>',
+         f'<path d="M{wx} {wy + 40}H{wx + ww}" stroke="{s["rule"]}"/>']
+    for k, c in enumerate([hi, s['dim'], s['dim']]):
+        b.append(f'<circle cx="{wx + 24 + k * 20}" cy="{wy + 20}" r="6" fill="{c}"/>')
+    b.append(d.text(W / 2, wy + 25, 'taz3r@mumbai: ~', 'fm', 11.5, mute, anchor='middle'))
+    b.append(d.text(wx + ww - 22, wy + 25, f'SEASON · {s["label"].upper()}', 'fm', 10.5, mute, ls=0.1, anchor='end'))
+
+    tx = wx + 26
+    y = wy + 40 + 34
+    n = 0
+    for cmd, outs, p_t, t0, t1, o_t in events:
+        n += 1
+        cmd_w = adv * len(cmd)
+        line = d.spans(tx, y, prompt + [(cmd, fg)], 'fm', size)
+        # The cover hides the command and steps right one character at a time; the cursor rides its edge.
+        name = f'ty{n}'
+        d.css.append(f'@keyframes {name}{{0%,{pc(t0)}%{{transform:translateX(0);animation-timing-function:steps({len(cmd)},end)}}'
+                     f'{pc(t1)}%,98%{{transform:translateX({cmd_w:.1f}px)}}100%{{transform:translateX(0)}}}}')
+        d.css.append(f'@keyframes cu{n}{{0%,{pc(o_t)}%{{opacity:1}}{pc(o_t + 0.02)}%,100%{{opacity:0}}}}')
+        cover = (f'<g class="cover" style="animation:{name} {T:.2f}s infinite both">'
+                 f'<rect x="{f1(tx + pw)}" y="{y - 19}" width="{f1(cmd_w + 30)}" height="26" fill="{win}"/>'
+                 f'<rect x="{f1(tx + pw + 1)}" y="{y - 16}" width="{f1(adv * 0.9)}" height="21" fill="{hi}" '
+                 f'style="animation:cu{n} {T:.2f}s linear infinite both"/></g>')
+        b.append(f'<g {appear(f"pl{n}", p_t)}>{line}{cover}</g>')
+        y += lh
+        for j, o in enumerate(outs):
+            b.append(f'<g {appear(f"o{n}x{j}", o_t + j * 0.14)}>{d.spans(tx, y, o, "fm", size)}</g>')
             y += lh
-        if cursor and cx is not None:
-            dr.rectangle([cx + 2, cy + 2, cx + 12, cy + 22], fill=hi)
-        return im
+    b.append(f'<g {appear("plast", final_t)}>{d.spans(tx, y, prompt, "fm", size)}'
+             f'<rect x="{f1(tx + pw + 1)}" y="{y - 16}" width="{f1(adv * 0.9)}" height="21" fill="{hi}" '
+             f'style="animation:blink 1.1s steps(1) infinite"/></g>')
+    return ''.join(b), H
 
-    frames, durs = [], []
+# ---------------------------------------------------------------- the page
 
-    def add(im, ms):
-        frames.append(im)
-        durs.append(ms)
 
-    done = []
-    add(frame(done, prompt), 600)
-    for cmd, outputs in script:
-        for i in range(2, len(cmd) + 2, 2):
-            add(frame(done, prompt + [(cmd[:i], fg)]), 55)
-        add(frame(done, prompt + [(cmd, fg)], cursor=False), 260)
-        done.append(prompt + [(cmd, fg)])
-        for o in outputs:
-            done.append(o)
-            add(frame(done, None, cursor=False), 140)
-        for k in range(2):
-            add(frame(done, prompt, cursor=True), 380)
-            add(frame(done, prompt, cursor=False), 380)
-    for k in range(4):
-        add(frame(done, prompt, cursor=True), 500)
-        add(frame(done, prompt, cursor=False), 500)
+SECTIONS = [sec_hero, sec_loadout, sec_journey, sec_contributions, sec_terminal]
 
-    pal = frames[-1].quantize(colors=64, method=Image.Quantize.MEDIANCUT)
-    q = [f.quantize(palette=pal, dither=Image.Dither.NONE) for f in frames]
-    q[0].save(out, save_all=True, append_images=q[1:], duration=durs, loop=0, optimize=True, disposal=1)
+
+def page_svg(s, ctx):
+    d = Doc(s)
+    parts, seams, y = [], [], 0
+    for fn in SECTIONS:
+        content, h = fn(d, ctx)
+        parts.append(f'<svg x="0" y="{f1(y)}" width="{W}" height="{f1(h)}" viewBox="0 0 {W} {f1(h)}">{content}</svg>')
+        y += h
+        seams.append(y)
+    d.h = H = round(y)
+    # One page, no gaps: a hairline marks where each section ends.
+    parts += [f'<path d="M48 {f1(sy)}H{W - 48}" stroke="{s["line"]}"/>' for sy in seams[:-1]]
+    d.css.append(BASE_CSS + f'svg{{--h:{H + 40}px}}')
+    d.defs.append(f'<clipPath id="page"><rect width="{W}" height="{H}" rx="22"/></clipPath>')
+    # No grain filter: as an <img> the whole page re-renders every animation frame,
+    # and a noise filter that size makes the animations crawl.
+    body = [f'<g clip-path="url(#page)">', sky_layers(d)]
+    if s['key'] == 'winter':
+        body.append(winter_ground(d))
+    body.append(weather(d, 11))
+    body += parts
+    body.append('</g>')
+    body.append(f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="22" fill="none" stroke="{s["line"]}"/>')
+    title = ('Taz3r, aka Abdur Rahmaan Reshamwala: I build Discord bots, and turn data into dashboards. '
+             'Loadout, journey, contributions and a terminal, in the ' + s['label'] + ' season.')
+    return d.render(title, ''.join(body))
+
+# ---------------------------------------------------------------- contributions data
+
+
+def fetch_contributions():
+    """Reads the public contribution graph. Private work only shows if the profile
+    setting 'Private contributions' is on."""
+    req = urllib.request.Request(f'https://github.com/users/{USER}/contributions',
+                                 headers={'User-Agent': 'taz3r-profile-build'})
+    page = urllib.request.urlopen(req, timeout=30).read().decode('utf8', 'replace')
+    counts = {}
+    for m in re.finditer(r'<tool-tip\b[^>]*\bfor="([^"]+)"[^>]*>([^<]*)</tool-tip>', page):
+        n = re.match(r'\s*([\d,]+) contributions?', m.group(2))
+        counts[m.group(1)] = int(n.group(1).replace(',', '')) if n else 0
+    days = []
+    for m in re.finditer(r'<td\b[^>]*\bdata-date="([\d-]+)"[^>]*>', page):
+        tag = m.group(0)
+        tid = re.search(r'\bid="([^"]+)"', tag)
+        lvl = re.search(r'\bdata-level="(\d)"', tag)
+        days.append({'date': m.group(1), 'level': int(lvl.group(1)) if lvl else 0,
+                     'count': counts.get(tid.group(1), 0) if tid else 0})
+    if len(days) < 300:
+        raise ValueError(f'expected a year of days, found {len(days)}')
+    days.sort(key=lambda x: x['date'])
+    tot = re.search(r'([\d,]+)\s+contributions?\s+in the last year', page)
+    total = int(tot.group(1).replace(',', '')) if tot else sum(x['count'] for x in days)
+    return {'total': total, 'days': days}
+
+
+def contributions(offline):
+    if not offline:
+        try:
+            data = fetch_contributions()
+            ART.mkdir(exist_ok=True)
+            CONTRIB_FILE.write_text(json.dumps(data, separators=(',', ':')) + '\n')
+            return data
+        except Exception as e:
+            print(f'warning: could not read contributions ({e}); using the saved ones')
+    if CONTRIB_FILE.exists():
+        return json.loads(CONTRIB_FILE.read_text())
+    return None
 
 # ---------------------------------------------------------------- README
 
@@ -750,20 +927,18 @@ def badge(label, color, logo, ink, href, alt):
             f'&logo={logo}&logoColor={ink.lstrip("#")}" alt="{alt}" /></a>')
 
 
-def readme(s, has_gif):
+def readme(s):
     key = s['key']
     tools = ', '.join(it[0] for g in TOOLKIT for it in g[2])
     bg, ink = (s['bg2'], s['fg']) if s['dark'] else (s['fill'], s['on_fill'])
-    gif = (f'\n<img src="art/terminal.gif" width="100%" alt="Terminal: whoami, what I am doing now, '
-           f'and my top tools" />\n') if has_gif else ''
+    alt = (f'Taz3r, aka Abdur Rahmaan Reshamwala, Mumbai. I build Discord bots, and turn data into dashboards. '
+           f'Open to a full-time internship. Loadout: {tools}. Journey: BASc at HSNC University 2024 to 2027, '
+           f'Tartarus 2025, Moba Legends: 5v5 bot developer since 2025, True Rippers 2026 and MLMS Season 1 champions. '
+           f'Plus my GitHub contributions for the last year.')
     return f"""<!-- Generated by scripts/build.py. Edit the script, not this file. -->
 <div align="center">
 
-<a href="{PORTFOLIO}"><img src="art/{key}/hero.svg" width="100%" alt="Taz3r, aka Abdur Rahmaan. I build Discord bots, and turn data into dashboards. Open to a full-time internship." /></a>
-{gif}
-<a href="{PORTFOLIO}"><img src="art/{key}/loadout.svg" width="100%" alt="Loadout: {tools}." /></a>
-
-<a href="{PORTFOLIO}/journey"><img src="art/{key}/journey.svg" width="100%" alt="Journey: BASc at HSNC University 2024 to 2027, Tartarus 2025, Moba Legends: 5v5 bot developer since 2025, True Rippers 2026 and MLMS Season 1 champions." /></a>
+<a href="{PORTFOLIO}"><img src="art/{key}/profile.svg" width="100%" alt="{alt}" /></a>
 
 {badge('Portfolio', bg, 'vercel', ink, PORTFOLIO, 'Portfolio')}
 {badge('Discord-taz3rrr', '#5865F2', 'discord', '#ffffff', 'https://discord.com/users/1260149377461256243', 'Discord')}
@@ -780,28 +955,25 @@ def readme(s, has_gif):
 
 
 def main(argv):
-    want_gif = '--no-gif' not in argv
+    offline = '--offline' in argv
     args = [a for a in argv if not a.startswith('--')]
     choice = (args[0] if args else (SEASON_FILE.read_text().strip() if SEASON_FILE.exists() else 'auto')).lower()
     if choice != 'auto' and choice not in SEASONS:
         sys.exit(f'Unknown season "{choice}". Use auto, {", ".join(SEASONS)}.')
     SEASON_FILE.write_text(choice + '\n')
-    today = dt.date.today().replace(day=1)  # month precision: rebuilds change once a month
+    today = dt.date.today()
     current = BY_MONTH[today.month - 1] if choice == 'auto' else choice
+    # The journey's "now" moves by month; the contributions change daily.
+    ctx = {'month': today.replace(day=1), 'contrib': contributions(offline)}
 
     for key, s in SEASONS.items():
         s = dict(s, key=key)
         folder = ART / key
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / 'hero.svg').write_text(hero_svg(s, today), encoding='utf8')
-        (folder / 'loadout.svg').write_text(loadout_svg(s), encoding='utf8')
-        (folder / 'journey.svg').write_text(journey_svg(s, today), encoding='utf8')
+        (folder / 'profile.svg').write_text(page_svg(s, ctx), encoding='utf8')
 
     s = dict(SEASONS[current], key=current)
-    gif = ART / 'terminal.gif'
-    if want_gif:
-        terminal_gif(s, gif)
-    (ROOT / 'README.md').write_text(readme(s, gif.exists()), encoding='utf8')
+    (ROOT / 'README.md').write_text(readme(s), encoding='utf8')
     print(f'Built all four seasons; README shows {s["label"]} ({choice}).')
 
 
