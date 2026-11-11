@@ -9,7 +9,6 @@
 <a href="https://www.instagram.com/taz3rrrr/"><img src="https://img.shields.io/badge/Instagram-E4405F?style=for-the-badge&logo=instagram&logoColor=ffffff" alt="Instagram" /></a>
 <a href="mailto:reshamwalaabdurrahmaan@gmail.com"><img src="https://img.shields.io/badge/Email-9e3f2d?style=for-the-badge&logo=gmail&logoColor=f6e7ce" alt="Email" /></a>
 
-<sub>Discord is the fastest way to reach me.
-<sub>Now showing: <b>Fall</b>.</sub></sub>
+<sub>Discord is the fastest way to reach me.<br>Now showing: <b>Fall</b>.</sub>
 
 </div>
